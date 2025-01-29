@@ -32,6 +32,7 @@ import rospy
 from gymnasium import spaces
 from scipy.spatial.transform import Rotation as R
 
+from lsy_drone_racing.sim.drone import Drone
 from lsy_drone_racing.sim.sim import Sim
 from lsy_drone_racing.utils import check_gate_pass
 from lsy_drone_racing.utils.import_utils import get_ros_package_path, pycrazyswarm
@@ -91,9 +92,9 @@ class DroneRacingDeployEnv(gymnasium.Env):
                 "target_gate": spaces.Discrete(n_gates, start=-1),
                 "gates_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(n_gates, 3)),
                 "gates_rpy": spaces.Box(low=-np.pi, high=np.pi, shape=(n_gates, 3)),
-                "gates_in_range": spaces.Box(low=0, high=1, shape=(n_gates,), dtype=np.bool_),
+                "gates_visited": spaces.Box(low=0, high=1, shape=(n_gates,), dtype=np.bool_),
                 "obstacles_pos": spaces.Box(low=-np.inf, high=np.inf, shape=(n_obstacles, 3)),
-                "obstacles_in_range": spaces.Box(
+                "obstacles_visited": spaces.Box(
                     low=0, high=1, shape=(n_obstacles,), dtype=np.bool_
                 ),
             }
@@ -105,8 +106,10 @@ class DroneRacingDeployEnv(gymnasium.Env):
         # pycrazyswarm expects strings, not Path objects, so we need to convert it first
         swarm = pycrazyswarm.Crazyswarm(str(crazyswarm_config_path))
         self.cf = swarm.allcfs.crazyflies[0]
-        names = [f"gate{g}" for g in range(1, len(config.env.track.gates) + 1)]
-        names += [f"obstacle{g}" for g in range(1, len(config.env.track.obstacles) + 1)]
+        names = []
+        if not self.config.deploy.practice_without_track_objects:
+            names += [f"gate{g}" for g in range(1, len(config.env.track.gates) + 1)]
+            names += [f"obstacle{g}" for g in range(1, len(config.env.track.obstacles) + 1)]
         self.vicon = Vicon(track_names=names, timeout=5)
         self.symbolic = None
         if config.env.symbolic:
@@ -121,6 +124,13 @@ class DroneRacingDeployEnv(gymnasium.Env):
             self.symbolic = sim.symbolic()
         self._last_pos = np.zeros(3)
 
+        self.gates_visited = np.array([False] * len(config.env.track.gates))
+        self.obstacles_visited = np.array([False] * len(config.env.track.obstacles))
+
+        # Use internal variable to store results of self.obs that is updated every time
+        # self.obs is invoked in order to prevent calling it more often than necessary.
+        self._obs = None
+
     def reset(
         self, *, seed: int | None = None, options: dict | None = None
     ) -> tuple[dict[str, NDArray[np.floating]], dict]:
@@ -129,8 +139,13 @@ class DroneRacingDeployEnv(gymnasium.Env):
         We cannot reset the track in the real world. Instead, we check if the gates, obstacles and
         drone are positioned within tolerances.
         """
-        check_race_track(self.config)
-        check_drone_start_pos(self.config)
+        if (
+            self.config.deploy.check_race_track
+            and not self.config.deploy.practice_without_track_objects
+        ):
+            check_race_track(self.config)
+        if self.config.deploy.check_drone_start_pos:
+            check_drone_start_pos(self.config)
         self._last_pos[:] = self.vicon.pos[self.vicon.drone_name]
         self.target_gate = 0
         info = self.info
@@ -145,15 +160,15 @@ class DroneRacingDeployEnv(gymnasium.Env):
     ) -> tuple[dict[str, NDArray[np.floating]], float, bool, bool, dict]:
         """Take a step in the environment.
 
-        Note:
-            Sleeps for the remaining time if the step took less than the control period. This
-            ensures that the environment is running at the correct frequency during deployment.
+        Warning:
+            Step does *not* wait for the remaining time if the step took less than the control
+            period. This ensures that controllers with longer action compute times can still hit
+            their target frequency. Furthermore, it implies that loops using step have to manage the
+            frequency on their own, and need to update the current observation and info before
+            computing the next action.
         """
-        tstart = time.perf_counter()
         pos, vel, acc, yaw, rpy_rate = action[:3], action[3:6], action[6:9], action[9], action[10:]
         self.cf.cmdFullState(pos, vel, acc, yaw, rpy_rate)
-        if (dt := time.perf_counter() - tstart) < 1 / self.config.env.freq:
-            rospy.sleep(1 / self.config.env.freq - dt)
         current_pos = self.vicon.pos[self.vicon.drone_name]
         self.target_gate += self.gate_passed(current_pos, self._last_pos)
         self._last_pos[:] = current_pos
@@ -163,46 +178,33 @@ class DroneRacingDeployEnv(gymnasium.Env):
         return self.obs, -1.0, terminated, False, self.info
 
     def close(self):
-        """Close the environment by stopping the drone and landing."""
-        if self.target_gate != -1:
-            return  # Don't try to land if the drone hasn't finished the race -> crashed most likely
-        start_pos = self.vicon.pos[self.vicon.drone_name]
-        gate_rot = R.from_euler("xyz", self.config.env.track.gates[-1].rpy)
-        final_pos = start_pos + gate_rot.as_matrix()[:, 1]
-        # Slow down after last gate and rise over the gates
-        t_max = 2.0
-        t_start = time.perf_counter()
-        while (dt := time.perf_counter() - t_start) < t_max:
-            rospy.sleep(0.033)
-            alpha = np.sqrt(np.minimum(dt / t_max, 1.0))  # Non-linear breaking
-            target_pos = alpha * final_pos + (1 - alpha) * start_pos
-            self.cf.cmdFullState(target_pos, np.zeros(3), np.zeros(3), 0, np.zeros(3))
-        # Fly up to avoid collisions
-        t_max = 2.0
-        t_start = time.perf_counter()
-        start_pos = self.vicon.pos[self.vicon.drone_name]
-        final_pos[2] = 2.0
-        while (dt := time.perf_counter() - t_start) < t_max:
-            rospy.sleep(0.033)
-            alpha = np.minimum(dt / t_max, 1.0)
-            target_pos = alpha * final_pos + (1 - alpha) * start_pos
-            self.cf.cmdFullState(target_pos, np.zeros(3), np.zeros(3), 0, np.zeros(3))
-        # Move back to intial state
-        t_max = 4.0
-        t_start = time.perf_counter()
-        start_pos = self.vicon.pos[self.vicon.drone_name]
-        final_pos = np.array([*self.config.env.track.drone.pos[:2], 2.0])
-        offset = 1.0  # Additional time at the end to really reach the des. position
-        while (dt := time.perf_counter() - t_start) < t_max + offset:
-            alpha = min(dt / t_max, 1.0)
-            target_pos = alpha * final_pos + (1 - alpha) * start_pos
-            # Additionally pass position difference as vel for more landing accuracy
-            vel = target_pos - self.vicon.pos[self.vicon.drone_name]
-            self.cf.cmdFullState(target_pos, vel, np.zeros(3), 0, np.zeros(3))
-            rospy.sleep(0.033)
+        """Close the environment by stopping the drone and landing back at the starting position."""
+        RETURN_HEIGHT = 1.75  # m
+        BREAKING_DISTANCE = 1.0  # m
+        BREAKING_DURATION = 4.0  # s
+        RETURN_DURATION = 5.0  # s
+        LAND_DURATION = 4.5  # s
 
-        self.cf.notifySetpointsStop()
-        self.cf.land(0.05, 3.0)
+        try:  # prevent hanging process if drone not reachable
+            self.cf.notifySetpointsStop()
+            obs = self.obs
+
+            return_pos = (
+                obs["pos"] + obs["vel"] / (np.linalg.norm(obs["vel"]) + 1e-8) * BREAKING_DISTANCE
+            )
+            return_pos[2] = RETURN_HEIGHT
+            self.cf.goTo(goal=return_pos, yaw=0, duration=BREAKING_DURATION)
+            # Smoothly transition to next position by setting the next goal earlier
+            time.sleep(BREAKING_DURATION - 1)
+
+            return_pos[:2] = self.config.env.track.drone.pos[:2]
+            self.cf.goTo(goal=return_pos, yaw=0, duration=RETURN_DURATION)
+            time.sleep(RETURN_DURATION)
+
+            self.cf.land(self.config.env.track.drone.pos[2], LAND_DURATION)
+            time.sleep(LAND_DURATION)
+        except rospy.service.ServiceException as e:
+            logger.error("Cannot return home: " + str(e))
 
     @property
     def obs(self) -> dict:
@@ -221,28 +223,45 @@ class DroneRacingDeployEnv(gymnasium.Env):
         n_gates = len(self.config.env.track.gates)
 
         obs["target_gate"] = self.target_gate if self.target_gate < n_gates else -1
-        # Add the gate and obstacle poses to the info. If gates or obstacles are in sensor range,
-        # use the actual pose, otherwise use the nominal pose.
+
         drone_pos = self.vicon.pos[self.vicon.drone_name]
+
         gates_pos = np.array([g.pos for g in self.config.env.track.gates])
-        gate_names = [f"gate{g}" for g in range(1, len(gates_pos) + 1)]
-        real_gates_pos = np.array([self.vicon.pos[g] for g in gate_names])
-        in_range = np.linalg.norm(real_gates_pos - drone_pos, axis=1) < sensor_range
-        gates_pos[in_range] = real_gates_pos[in_range]
         gates_rpy = np.array([g.rpy for g in self.config.env.track.gates])
-        real_gates_rpy = np.array([self.vicon.rpy[g] for g in gate_names])
-        gates_rpy[in_range] = real_gates_rpy[in_range]
-        obs["gates_pos"] = gates_pos.astype(np.float32)
-        obs["gates_rpy"] = gates_rpy.astype(np.float32)
-        obs["gates_in_range"] = in_range
+        gate_names = [f"gate{g}" for g in range(1, len(gates_pos) + 1)]
 
         obstacles_pos = np.array([o.pos for o in self.config.env.track.obstacles])
         obstacle_names = [f"obstacle{g}" for g in range(1, len(obstacles_pos) + 1)]
-        real_obstacles_pos = np.array([self.vicon.pos[o] for o in obstacle_names])
-        in_range = np.linalg.norm(real_obstacles_pos - drone_pos, axis=1) < sensor_range
-        obstacles_pos[in_range] = real_obstacles_pos[in_range]
+
+        real_gates_pos = gates_pos
+        real_gates_rpy = gates_rpy
+        real_obstacles_pos = obstacles_pos
+        # Update objects position with vicon data if not in practice mode and object
+        # either is in range or was in range previously.
+        if not self.config.deploy.practice_without_track_objects:
+            real_gates_pos = np.array([self.vicon.pos[g] for g in gate_names])
+            real_gates_rpy = np.array([self.vicon.rpy[g] for g in gate_names])
+            real_obstacles_pos = np.array([self.vicon.pos[o] for o in obstacle_names])
+
+        # Use x-y distance to calucate sensor range, otherwise it would depend on the height of the
+        # drone and obstacle how early the obstacle is in range.
+        in_range = np.linalg.norm(real_gates_pos[:, :2] - drone_pos[:2], axis=1) < sensor_range
+        self.gates_visited = np.logical_or(self.gates_visited, in_range)
+        gates_pos[self.gates_visited] = real_gates_pos[self.gates_visited]
+        gates_rpy[self.gates_visited] = real_gates_rpy[self.gates_visited]
+        obs["gates_visited"] = self.gates_visited
+        print(f"gates visited: {self.gates_visited}")
+
+        in_range = np.linalg.norm(real_obstacles_pos[:, :2] - drone_pos[:2], axis=1) < sensor_range
+        self.obstacles_visited = np.logical_or(self.obstacles_visited, in_range)
+        obstacles_pos[self.obstacles_visited] = real_obstacles_pos[self.obstacles_visited]
+        obs["obstacles_visited"] = self.obstacles_visited
+        print(f"obs visited: {self.obstacles_visited}")
+
+        obs["gates_pos"] = gates_pos.astype(np.float32)
+        obs["gates_rpy"] = gates_rpy.astype(np.float32)
         obs["obstacles_pos"] = obstacles_pos.astype(np.float32)
-        obs["obstacles_in_range"] = in_range
+        self._obs = obs
         return obs
 
     @property
@@ -259,10 +278,10 @@ class DroneRacingDeployEnv(gymnasium.Env):
         """
         n_gates = len(self.config.env.track.gates)
         if self.target_gate < n_gates and self.target_gate != -1:
-            # Gate IDs go from 0 to N-1, but names go from 1 to N
-            gate_id, gate_size = "gate" + str(self.target_gate + 1), (0.45, 0.45)
-            gate_pos = self.vicon.pos[gate_id]
-            gate_rot = R.from_euler("xyz", self.vicon.rpy[gate_id])
+            # Real gates measure 0.4m x 0.4m, we account for meas. error
+            gate_size = (0.56, 0.56)
+            gate_pos = self._obs["gates_pos"][self.target_gate]
+            gate_rot = R.from_euler("xyz", self._obs["gates_rpy"][self.target_gate])
             return check_gate_pass(gate_pos, gate_rot, gate_size, pos, prev_pos)
         return False
 
@@ -283,25 +302,25 @@ class DroneRacingThrustDeployEnv(DroneRacingDeployEnv):
         """
         super().__init__(config)
         self.action_space = gymnasium.spaces.Box(low=-1, high=1, shape=(4,))
+        self.drone = Drone("mellinger")
 
     def step(
         self, action: NDArray[np.floating]
     ) -> tuple[dict[str, NDArray[np.floating]], float, bool, bool, dict]:
         """Take a step in the environment.
 
-        Note:
-            Sleeps for the remaining time if the step took less than the control period. This
-            ensures that the environment is running at the correct frequency during deployment.
+        Warning:
+            Step does *not* wait for the remaining time if the step took less than the control
+            period. This ensures that controllers with longer action compute times can still hit
+            their target frequency. Furthermore, it implies that loops using step have to manage the
+            frequency on their own, and need to update the current observation and info before
+            computing the next action.
         """
-        tstart = time.perf_counter()
         assert action.shape == self.action_space.shape, f"Invalid action shape: {action.shape}"
         collective_thrust, rpy = action[0], action[1:]
         rpy_deg = np.rad2deg(rpy)
-        # Crazyflie expects negated pitch command. TODO: Check why this is the case and fix this on
-        # the firmware side if possible.
-        self.cf.cmdVel(rpy_deg[0], -rpy_deg[1], rpy_deg[2], collective_thrust)
-        if (dt := time.perf_counter() - tstart) < 1 / self.config.env.freq:
-            rospy.sleep(1 / self.config.env.freq - dt)
+        collective_thrust = self.drone._thrust_to_pwms(collective_thrust)
+        self.cf.cmdVel(*rpy_deg, collective_thrust)
         current_pos = self.vicon.pos[self.vicon.drone_name]
         self.target_gate += self.gate_passed(current_pos, self._last_pos)
         self._last_pos[:] = current_pos
