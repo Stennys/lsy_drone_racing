@@ -17,9 +17,9 @@ class RRT:
             self.p = np.array([x, y, z])
 
     def __init__(self, start, goal, obstacle_list, gates, rand_area, gates_rpy,
-                 expand_dis=0.6, path_resolution=0.3, goal_sample_rate=30,
+                 expand_dis=0.7, path_resolution=0.3, goal_sample_rate=30,
                  max_iter=50000, play_area=None, robot_radius=0.01,
-                 gate_width=0.01, gate_height=0.01, gate_depth=0.9):
+                 gate_width=0.3, gate_height=0.3, gate_depth=0.9):
         self.start = self.Node(start[0], start[1], start[2])
         self.goal = self.Node(goal[0], goal[1], goal[2])
         self.gates = [self.Node(g[0], g[1], g[2]) for g in (gates or [])]
@@ -46,6 +46,9 @@ class RRT:
 
         for i, gate in enumerate(self.gates + [self.final_goal]):
             self.goal = gate
+            # print(self.gates_rpy[0][i])
+            # gate += self.get_rotation_matrix(*(self.gates_rpy[0][i])) @ np.array([0, 0.1, 0])
+
             self.node_list = [current_start]
 
             path_found = False
@@ -189,15 +192,13 @@ class RRT:
         p1_local = R.T @ (point1 - gate_pos)
         p2_local = R.T @ (point2 - gate_pos)
     
-        # Ensure the path crosses the gate plane
+
         if p1_local[2] * p2_local[2] > 0:
             return False
-    
-        # Compute intersection with the gate plane
+
         t = -p1_local[2] / (p2_local[2] - p1_local[2])
         intersection = p1_local + t * (p2_local - p1_local)
     
-        # Stricter bounding box check
         safe_width = self.gate_width * 0.5
         safe_height = self.gate_height * 0.5
     
@@ -205,12 +206,11 @@ class RRT:
             return False
     
         # Gate clearance check
-        clearance_margin = 0.1  # Additional buffer around the gate edges
+        clearance_margin = 1 
         if abs(intersection[0]) > (self.gate_width / 2 - clearance_margin) or \
            abs(intersection[1]) > (self.gate_height / 2 - clearance_margin):
             return False
     
-        # Better approach angle filtering
         trajectory = p2_local - p1_local
         approach_angle = np.arctan2(np.sqrt(trajectory[0]**2 + trajectory[1]**2), abs(trajectory[2]))
     
@@ -218,7 +218,7 @@ class RRT:
             return False
     
         # Collision-free straight line check through the gate
-        num_samples = 10
+        num_samples = 1000
         for i in range(num_samples):
             sample_point = p1_local + (p2_local - p1_local) * (i / num_samples)
             if not self.check_collision(R @ sample_point + gate_pos):
@@ -244,3 +244,7 @@ class RRT:
                        [0, 0, 1]])
 
         return Rz @ Ry @ Rx
+    
+    def entry_and_exit(self, gate, rpy):
+        distance = 0.1
+

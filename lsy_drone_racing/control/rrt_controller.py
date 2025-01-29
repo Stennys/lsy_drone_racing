@@ -61,6 +61,15 @@ class RRT_Controller(BaseController):
         # print(gates_rpy)
         # self.obs_list.extend(gates_as_obstacles)
         print(self.obs_list)
+        print(initial_obs["gates_pos"])
+        for i, gate in enumerate(initial_obs["gates_pos"] + self.start):
+            rpy = gates_rpy[0][i] if i < len(gates_rpy[0]) else (0, 0, 0)
+            # 0.2 works wtf
+            print(f"old gate {gate}")
+            gate += self.get_rotation_matrix(*rpy) @ np.array([0, 0.1, 0])
+            print(f"New gate {gate}")
+            # print(gate)
+
         self.rrt = RRT(
                        start=self.start,
                        goal=initial_obs["gates_pos"][0],
@@ -89,6 +98,7 @@ class RRT_Controller(BaseController):
         # Create a cubic spline from the RRT path
         self.t_total = len(self.rrt_path)  # Total time proportional to the number of waypoints
         t = np.linspace(0, self.t_total, len(self.rrt_path))
+        # self.trajectory = CubicSpline(t, self.rrt_path)
         self.trajectory = CubicSpline(t, self.rrt_path)
         self._tick = 0
         self._freq = initial_info["env_freq"]
@@ -163,3 +173,25 @@ class RRT_Controller(BaseController):
     #         "z_max": z_c + depth / 2,
     #     }
     #     return bounds
+
+
+    def get_rotation_matrix(self, roll, pitch, yaw):
+        cos_r, sin_r = np.cos(roll), np.sin(roll)
+        cos_p, sin_p = np.cos(pitch), np.sin(pitch)
+        cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+
+        Rx = np.array([[1, 0, 0],
+                       [0, cos_r, -sin_r],
+                       [0, sin_r, cos_r]])
+
+        Ry = np.array([[cos_p, 0, sin_p],
+                       [0, 1, 0],
+                       [-sin_p, 0, cos_p]])
+
+        Rz = np.array([[cos_y, -sin_y, 0],
+                       [sin_y, cos_y, 0],
+                       [0, 0, 1]])
+
+        return Rz @ Ry @ Rx
+    
+
