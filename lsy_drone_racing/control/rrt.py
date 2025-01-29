@@ -2,7 +2,9 @@ import math
 import random
 import numpy as np
 from scipy.spatial import KDTree
-
+# from thrust_controller import ThrustController
+from lsy_drone_racing.control.thrust_controller import ThrustController
+import pybullet as p
 class RRT:
     class Node:
         def __init__(self, x, y, z):
@@ -17,29 +19,34 @@ class RRT:
             self.p = np.array([x, y, z])
 
     def __init__(self, start, goal, obstacle_list, gates, rand_area, gates_rpy,
-                 expand_dis=0.6, path_resolution=0.3, goal_sample_rate=30,
-                 max_iter=50000, play_area=None, robot_radius=0.01,
-                 gate_width=0.01, gate_height=0.01, gate_depth=0.9):
-        self.start = self.Node(start[0], start[1], start[2])
-        self.goal = self.Node(goal[0], goal[1], goal[2])
-        self.gates = [self.Node(g[0], g[1], g[2]) for g in (gates or [])]
-        self.final_goal = self.goal
-        self.min_rand = rand_area[0]
-        self.max_rand = rand_area[1]
-        self.expand_dis = expand_dis
-        self.path_resolution = path_resolution
-        self.goal_sample_rate = goal_sample_rate
-        self.max_iter = max_iter
-        self.obstacle_list = obstacle_list
-        self.node_list = []
-        self.robot_radius = robot_radius
-        self.play_area = play_area
-        self.gate_width = gate_width
-        self.gate_height = gate_height
-        self.gate_depth = gate_depth
-        self.gates_rpy = gates_rpy
-        self.obstacle_kd_tree = KDTree([obs[:3] for obs in obstacle_list]) if obstacle_list else None
+                    expand_dis=0.6, path_resolution=0.3, goal_sample_rate=30,
+                    max_iter=50000, play_area=None, robot_radius=0.01,
+                    gate_width=0.3, gate_height=0.3, gate_depth=0.1, 
+                    thrust_controller=None, max_acceleration=5.0):
+            
+            self.start = self.Node(start[0], start[1], start[2])
+            self.goal = self.Node(goal[0], goal[1], goal[2])
+            self.gates = [self.Node(g[0], g[1], g[2]) for g in (gates or [])]
+            self.final_goal = self.goal
+            self.min_rand = rand_area[0]
+            self.max_rand = rand_area[1]
+            self.expand_dis = expand_dis
+            self.path_resolution = path_resolution
+            self.goal_sample_rate = goal_sample_rate
+            self.max_iter = max_iter
+            self.obstacle_list = obstacle_list
+            self.node_list = []
+            self.robot_radius = robot_radius
+            self.play_area = play_area
+            self.gate_width = gate_width
+            self.gate_height = gate_height
+            self.gate_depth = gate_depth
+            self.gates_rpy = gates_rpy
+            self.obstacle_kd_tree = KDTree([obs[:3] for obs in obstacle_list]) if obstacle_list else None
+            self.thrust_controller = thrust_controller
+            self.max_acceleration = max_acceleration
 
+    
     def planning(self):
         full_path = []
         current_start = self.start
@@ -55,39 +62,51 @@ class RRT:
                 nearest_node = self.node_list[nearest_ind]
                 new_node = self.steer(nearest_node, rnd_node, self.expand_dis)
 
-                if self.check_collision(new_node.p):
+                if self.check_collision(new_node.p) and self.check_dynamics(nearest_node, new_node):
                     near_inds = self.find_near_nodes(new_node)
                     new_node = self.choose_parent(new_node, near_inds)
                     self.node_list.append(new_node)
                     self.rewire(new_node, near_inds)
 
-                    dist_to_gate = self.calc_dist_to_goal(new_node.x, new_node.y, new_node.z, gate)
-
-                    if dist_to_gate <= self.expand_dis * 2:
-                        rpy = self.gates_rpy[0][i] if i < len(self.gates_rpy[0]) else (0, 0, 0)
+                    if self.calc_dist_to_goal(new_node.x, new_node.y, new_node.z, gate) <= self.expand_dis:
+                        rpy = self.gates_rpy[i] if i < len(self.gates_rpy) else (0, 0, 0)
                         if self.check_gate_passage(nearest_node.p, new_node.p, gate, rpy):
                             path_segment = self.generate_final_course(len(self.node_list) - 1)
                             path_found = True
                             break
 
             if not path_found:
+                print(f"Failed to find a path to gate {i + 1}.")
                 return None
 
+            # Compute entry and exit points for the gate
+            rpy = self.gates_rpy[i] if i < len(self.gates_rpy) else (0, 0, 0)
+            entry, exit = self.get_gate_entry_exit(gate, rpy)
             full_path.extend(path_segment if not full_path else path_segment[1:])
+            full_path.append(entry)  # Add entry point
+            full_path.append(exit)   # Add exit point
 
-            last_point = np.array(path_segment[-1])
-            direction_to_next_gate = np.array([gate.x, gate.y, gate.z]) - last_point
-            direction_norm = np.linalg.norm(direction_to_next_gate)
-
-            if direction_norm < 1e-10:
-                new_start = last_point
-            else:
-                direction_to_next_gate = direction_to_next_gate / direction_norm
-                new_start = last_point + direction_to_next_gate * (self.expand_dis * 0.5)
-
-            current_start = self.Node(*new_start)
-
+            current_start = self.Node(*exit)
         return full_path
+
+
+
+    def check_dynamics(self, from_node, to_node):
+        if not self.thrust_controller:
+            return True
+
+        distance = np.linalg.norm(to_node.p - from_node.p)
+        num_steps = max(2, int(distance / self.path_resolution))
+
+        for step in np.linspace(0, 1, num_steps):
+            interp_point = from_node.p + step * (to_node.p - from_node.p)
+            desired_acc = (interp_point - from_node.p) * self.max_acceleration
+            thrust, _ = self.thrust_controller.compute_control({"pos": interp_point, "acc": desired_acc})
+
+            if thrust > self.thrust_controller.drone_mass * self.thrust_controller.g * 1.8:
+                return False
+
+        return True
 
     def get_random_node(self):
         if random.randint(0, 100) > self.goal_sample_rate:
@@ -116,6 +135,7 @@ class RRT:
 
         return new_node
 
+
     def check_collision(self, point):
         clearance = 0.05
         if self.obstacle_kd_tree:
@@ -125,7 +145,7 @@ class RRT:
             if d <= nearest_obstacle[3] + self.robot_radius + clearance:
                 return False
         return True
-
+    
     def get_nearest_node_index(self, node_list, rnd_node):
         dlist = [(np.sum((node.p - rnd_node.p)**2) + 1e-10) for node in node_list]
         return dlist.index(min(dlist))
@@ -181,50 +201,37 @@ class RRT:
             node = node.parent
         path.append(node.p)
         return path[::-1]
-
+    
     def check_gate_passage(self, point1, point2, gate, rpy):
         gate_pos = np.array([gate.x, gate.y, gate.z])
+        # print(*rpy)
         R = self.get_rotation_matrix(*rpy)
-    
+        
+        # Transform points to gate's local coordinate system
         p1_local = R.T @ (point1 - gate_pos)
         p2_local = R.T @ (point2 - gate_pos)
-    
-        # Ensure the path crosses the gate plane
+
+        # Check if trajectory intersects gate plane
         if p1_local[2] * p2_local[2] > 0:
             return False
-    
-        # Compute intersection with the gate plane
-        t = -p1_local[2] / (p2_local[2] - p1_local[2])
+
+        # Compute intersection point in gate's local coordinates
+        t = -p1_local[2] / (p2_local[2] - p1_local[2]) if p2_local[2] - p1_local[2] != 0 else 1.0
         intersection = p1_local + t * (p2_local - p1_local)
-    
-        # Stricter bounding box check
-        safe_width = self.gate_width * 0.5
-        safe_height = self.gate_height * 0.5
-    
-        if abs(intersection[0]) > safe_width / 2 or abs(intersection[1]) > safe_height / 2:
+
+        # Check if intersection is within gate boundaries
+        if abs(intersection[0]) > self.gate_width / 2 or abs(intersection[1]) > self.gate_height / 2:
             return False
-    
-        # Gate clearance check
-        clearance_margin = 0.1  # Additional buffer around the gate edges
-        if abs(intersection[0]) > (self.gate_width / 2 - clearance_margin) or \
-           abs(intersection[1]) > (self.gate_height / 2 - clearance_margin):
-            return False
-    
-        # Better approach angle filtering
-        trajectory = p2_local - p1_local
-        approach_angle = np.arctan2(np.sqrt(trajectory[0]**2 + trajectory[1]**2), abs(trajectory[2]))
-    
-        if approach_angle > np.pi / 6:  # Stricter angle constraint
-            return False
-    
-        # Collision-free straight line check through the gate
-        num_samples = 10
-        for i in range(num_samples):
-            sample_point = p1_local + (p2_local - p1_local) * (i / num_samples)
-            if not self.check_collision(R @ sample_point + gate_pos):
+
+        # Sample points along trajectory to ensure consistent passage
+        num_samples = 30
+        for step in np.linspace(0, 1, num_samples):
+            sample_local = p1_local + step * (p2_local - p1_local)
+            if abs(sample_local[0]) > self.gate_width / 2 or abs(sample_local[1]) > self.gate_height / 2:
                 return False
-    
+
         return True
+
 
     def get_rotation_matrix(self, roll, pitch, yaw):
         cos_r, sin_r = np.cos(roll), np.sin(roll)
@@ -244,3 +251,28 @@ class RRT:
                        [0, 0, 1]])
 
         return Rz @ Ry @ Rx
+
+    def visualize_gates(self):
+    # """Creates visual markers at the center of each gate in PyBullet."""
+        for gate in self.adj_gates:
+            p.loadURDF("sphere_small.urdf", gate, useFixedBase=True)
+        return 0
+
+    def get_gate_entry_exit(self, gate, rpy):
+        """
+        Compute entry and exit points for a gate based on its orientation.
+        """
+        gate_pos = np.array([gate.x, gate.y, gate.z])
+        R = self.get_rotation_matrix(*rpy)
+
+        # Entry and exit offsets in the gate's local coordinate system
+        # Assuming the gate's forward direction is along its local X-axis
+        offset = 0.1
+        entry_offset = np.array([0, -offset, 0])  # Backward along X-axis 
+        exit_offset = np.array([0, offset, 0])   # Forward along X-axis
+
+        # Transform offsets to global coordinates
+        entry_global = gate_pos + R @ entry_offset
+        exit_global = gate_pos + R @ exit_offset
+
+        return entry_global, exit_global

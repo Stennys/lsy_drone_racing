@@ -57,18 +57,19 @@ class RRT_Controller(BaseController):
             # print(initial_obs["gates_pos"])
         self.obs_list = [(*obstacle, 0.1) for obstacle in initial_obs["obstacles_pos"]]
         gate_radius = 0.001
-        gates_rpy = [initial_obs['gates_rpy']]
+        gates_rpy = initial_obs['gates_rpy']
         # print(gates_rpy)
         # self.obs_list.extend(gates_as_obstacles)
         print(self.obs_list)
         self.rrt = RRT(
                        start=self.start,
-                       goal=initial_obs["gates_pos"][0],
+                    #    goal=initial_obs["gates_pos"][0],
+                       goal=self.start,
                        rand_area=[0, 1000],
                        obstacle_list= self.obs_list,
                        gates=(initial_obs["gates_pos"]).tolist(),
                     #    play_area=[-10,10,-10,10,0,10],
-                       max_iter = 50000,
+                       max_iter = 500000,
                        gates_rpy = gates_rpy,
                     #    gates_as_obstacles = gates_as_obstacles,
                        )

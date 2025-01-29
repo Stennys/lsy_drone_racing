@@ -167,3 +167,8 @@ class ThrustController(BaseController):
         """Reset the integral error."""
         self.i_error[:] = 0
         self._tick = 0
+        
+    def compute(
+        self, obs: npt.NDArray[np.floating], info: dict | None = None
+    ) -> npt.NDArray[np.floating]:
+        return self.compute_control(obs, info)
