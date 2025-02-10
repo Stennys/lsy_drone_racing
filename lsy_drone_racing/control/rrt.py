@@ -81,12 +81,13 @@ class RRT:
 
             # Compute entry and exit points for the gate
             rpy = self.gates_rpy[i] if i < len(self.gates_rpy) else (0, 0, 0)
-            entry, exit = self.get_gate_entry_exit(gate, rpy)
+            # entry, exit = self.get_gate_entry_exit(gate, rpy)
             full_path.extend(path_segment if not full_path else path_segment[1:])
-            full_path.append(entry)  # Add entry point
-            full_path.append(exit)   # Add exit point
+            # full_path.append(entry)  # Add entry point
+            # full_path.append(exit)   # Add exit point
 
-            current_start = self.Node(*exit)
+            # current_start = self.Node(*exit)
+            current_start = self.Node(*path_segment[-1])
         return full_path
 
 
